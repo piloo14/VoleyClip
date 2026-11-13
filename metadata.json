@@ -1,0 +1,11 @@
+{
+  "name": "Cortazo Pro - Análisis Táctico de Vídeo Deportivo",
+  "description": "Herramienta profesional de análisis táctico de vídeo para entrenadores deportivos. Recorte de jugadas, control de ritmo y posesión, pizarra sobre vídeo, notas de voz, marca de agua de club y exportación compartible.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
