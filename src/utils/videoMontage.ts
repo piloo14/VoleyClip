@@ -7,6 +7,9 @@ export interface MontageProgressCallback {
 }
 
 const MAX_DIRECT_UPLOAD_BYTES = 24 * 1024 * 1024; // 24 MB (safe under Cloud Run 32MB request limit)
+const WASM_CONCAT_BATCH_SIZE = 5; // Keep peak WASM heap bounded even with 15-20+ clips
+const TARGET_FPS = 30;
+const CLIENT_VIDEO_BITRATE = 6_500_000; // 6.5 Mbps (5-8 Mbps high-clarity range)
 
 // Singleton browser FFmpeg instance
 let ffmpegInstance: FFmpeg | null = null;
@@ -111,8 +114,134 @@ async function getLoadedFFmpegWithTimeout(timeoutMs = 20000): Promise<FFmpeg> {
 }
 
 /**
+ * Helper: runs a single-pass `concat` filter graph in FFmpeg.wasm over <= 5 segments,
+ * normalizing CFR 30fps, yuv420p, even dimensions, SAR 1:1, PTS-STARTPTS reset, and 50ms audio fades.
+ */
+async function execWasmConcatFilterBatch(
+  ffmpeg: FFmpeg,
+  segments: Array<{ inputPath: string; startTime?: number; duration: number; applyAudioFade: boolean }>,
+  outputFileName: string,
+  preferAudio: boolean
+): Promise<{ ok: boolean; usedAudio: boolean }> {
+  const buildArgs = (withAudio: boolean): string[] => {
+    const args: string[] = ['-y'];
+    const filterParts: string[] = [];
+    const concatInputs: string[] = [];
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (seg.startTime !== undefined) {
+        args.push('-ss', Math.max(0, seg.startTime).toFixed(3));
+        args.push('-t', Math.max(0.25, seg.duration).toFixed(3));
+      }
+      args.push('-i', seg.inputPath);
+
+      filterParts.push(
+        `[${i}:v]fps=${TARGET_FPS},scale='min(1280,iw)':-2:flags=bilinear,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`
+      );
+
+      if (withAudio) {
+        if (seg.applyAudioFade) {
+          const fadeDur = Math.min(0.05, +(seg.duration / 3).toFixed(3));
+          const fadeOutStart = Math.max(0, +(seg.duration - fadeDur).toFixed(3));
+          filterParts.push(
+            `[${i}:a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,afade=t=in:st=0:d=${fadeDur.toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur.toFixed(3)}[a${i}]`
+          );
+        } else {
+          filterParts.push(
+            `[${i}:a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`
+          );
+        }
+        concatInputs.push(`[v${i}][a${i}]`);
+      } else {
+        concatInputs.push(`[v${i}]`);
+      }
+    }
+
+    if (withAudio) {
+      filterParts.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=1[outv][outa]`);
+      args.push(
+        '-filter_complex',
+        filterParts.join(';'),
+        '-map',
+        '[outv]',
+        '-map',
+        '[outa]',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '22',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        String(TARGET_FPS),
+        '-vsync',
+        '1',
+        '-g',
+        String(TARGET_FPS),
+        '-keyint_min',
+        String(TARGET_FPS),
+        '-c:a',
+        'aac',
+        '-ar',
+        '44100',
+        '-b:a',
+        '128k',
+        '-movflags',
+        '+faststart',
+        outputFileName
+      );
+    } else {
+      filterParts.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=0[outv]`);
+      args.push(
+        '-filter_complex',
+        filterParts.join(';'),
+        '-map',
+        '[outv]',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '22',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        String(TARGET_FPS),
+        '-vsync',
+        '1',
+        '-g',
+        String(TARGET_FPS),
+        '-keyint_min',
+        String(TARGET_FPS),
+        '-an',
+        '-movflags',
+        '+faststart',
+        outputFileName
+      );
+    }
+
+    return args;
+  };
+
+  if (preferAudio) {
+    const audioExit = await ffmpeg.exec(buildArgs(true));
+    if (audioExit === 0) {
+      return { ok: true, usedAudio: true };
+    }
+  }
+
+  const silentExit = await ffmpeg.exec(buildArgs(false));
+  return { ok: silentExit === 0, usedAudio: false };
+}
+
+/**
  * High-Performance Client-Side WebAssembly Video Concatenation using @ffmpeg/ffmpeg.
- * Uses WORKERFS to mount local File/Blob directly with 0 MB RAM copy so even 2GB+ videos work!
+ * - Mounts local File/Blob via WORKERFS (0 MB source RAM copy).
+ * - Uses filter_complex `concat` with PTS-STARTPTS + 50ms audio fades + libx264 ultrafast CRF 22 30fps.
+ * - Processes 15-20+ clips in bounded batches of 5 and deletes temp files immediately to keep memory stable.
  */
 export async function concatenateClipsWithFFmpegWasm(
   sourceVideoUrl: string,
@@ -125,7 +254,7 @@ export async function concatenateClipsWithFFmpegWasm(
   }
 
   const totalClips = clips.length;
-  onProgress?.(1, totalClips, 20, 'Cargando motor FFmpeg WebAssembly (30 FPS CFR)...');
+  onProgress?.(1, totalClips, 18, 'Cargando motor FFmpeg WebAssembly (30 FPS CFR)...');
 
   const ffmpeg = await getLoadedFFmpegWithTimeout(20000);
   const sourceBlob = await resolveSourceBlob(sourceVideoUrl);
@@ -133,7 +262,7 @@ export async function concatenateClipsWithFFmpegWasm(
     throw new Error('El archivo de vídeo fuente es demasiado pequeño o está corrupto.');
   }
 
-  onProgress?.(1, totalClips, 25, 'Montando vídeo fuente sin consumo de memoria...');
+  onProgress?.(1, totalClips, 22, 'Montando vídeo fuente sin saturar memoria...');
 
   let inputPathInVfs = '/input/source.mp4';
   let mountedWorkerFs = false;
@@ -159,179 +288,178 @@ export async function concatenateClipsWithFFmpegWasm(
   }
 
   if (!mountedWorkerFs) {
-    // Only copy into WASM MEMFS if <= 150 MB to prevent browser OOM crashes
     if (sourceBlob.size > 150 * 1024 * 1024) {
       throw new Error('Vídeo demasiado grande para memoria WASM; cambiando a renderizador continuo.');
     }
     inputPathInVfs = 'source.mp4';
-    const sourceBytes = new Uint8Array(await sourceBlob.arrayBuffer());
-    await ffmpeg.writeFile(inputPathInVfs, sourceBytes);
+    // Scope sourceBytes tightly so GC can reclaim the JS copy right after writeFile
+    {
+      const sourceBytes = new Uint8Array(await sourceBlob.arrayBuffer());
+      await ffmpeg.writeFile(inputPathInVfs, sourceBytes);
+    }
   }
 
-  const inputFiles: string[] = [];
+  const tempFilesToClean = new Set<string>();
+  let activeProgressHandler: ((ev: { progress: number }) => void) | null = null;
+
+  const setWasmProgressWindow = (
+    clipIdxDisplay: number,
+    basePct: number,
+    spanPct: number,
+    label: string
+  ) => {
+    if (activeProgressHandler) {
+      ffmpeg.off('progress', activeProgressHandler);
+    }
+    activeProgressHandler = ({ progress }) => {
+      const clamped = Math.max(0, Math.min(1, Number.isFinite(progress) ? progress : 0));
+      const pct = Math.min(96, Math.round(basePct + clamped * spanPct));
+      onProgress?.(clipIdxDisplay, totalClips, pct, label);
+    };
+    ffmpeg.on('progress', activeProgressHandler);
+  };
 
   try {
-    for (let i = 0; i < clips.length; i++) {
-      const clip = clips[i];
-      const s = Math.max(0, clip.startTime);
-      const dur = Math.max(0.3, clip.endTime - clip.startTime);
-      const clipFileName = `input${i}.mp4`;
-      inputFiles.push(clipFileName);
+    let sourceHasAudio = true;
 
-      const stepPct = 25 + Math.round(((i + 0.2) / totalClips) * 55);
-      onProgress?.(i + 1, totalClips, stepPct, `Recortando ${clip.title} (${i + 1}/${totalClips})...`);
+    // Single-pass filter_complex concat when <= WASM_CONCAT_BATCH_SIZE clips
+    if (clips.length <= WASM_CONCAT_BATCH_SIZE) {
+      tempFilesToClean.add('output.mp4');
+      setWasmProgressWindow(
+        totalClips,
+        24,
+        68,
+        `Recodificando y uniendo ${totalClips} ${totalClips === 1 ? 'clip' : 'clips'} a 30 FPS...`
+      );
+      onProgress?.(1, totalClips, 24, `Uniendo ${totalClips} clips con alineación exacta de frames...`);
 
-      // Place -ss BEFORE -i for instant keyframe seeking (avoids decoding from 00:00:00)
-      // Scale max 1280px wide (even dimensions) + strict 30 FPS CFR
-      let cutExit = await ffmpeg.exec([
-        '-y',
-        '-ss',
-        s.toFixed(3),
-        '-i',
-        inputPathInVfs,
-        '-t',
-        dur.toFixed(3),
-        '-vf',
-        "scale='min(1280,iw)':-2,fps=30,setpts=PTS-STARTPTS",
-        '-af',
-        'asetpts=PTS-STARTPTS',
-        '-c:v',
-        'libx264',
-        '-r',
-        '30',
-        '-vsync',
-        '1',
-        '-preset',
-        'ultrafast',
-        '-pix_fmt',
-        'yuv420p',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-ar',
-        '44100',
-        '-g',
-        '30',
-        '-keyint_min',
-        '30',
-        '-movflags',
-        '+faststart',
-        clipFileName
-      ]);
+      const segments = clips.map((c) => ({
+        inputPath: inputPathInVfs,
+        startTime: Math.max(0, c.startTime),
+        duration: Math.max(0.25, c.endTime - c.startTime),
+        applyAudioFade: true
+      }));
 
-      // Fallback for silent/video-only sources (no audio track)
-      if (cutExit !== 0) {
-        cutExit = await ffmpeg.exec([
-          '-y',
-          '-ss',
-          s.toFixed(3),
-          '-i',
-          inputPathInVfs,
-          '-t',
-          dur.toFixed(3),
-          '-vf',
-          "scale='min(1280,iw)':-2,fps=30,setpts=PTS-STARTPTS",
-          '-c:v',
-          'libx264',
-          '-r',
-          '30',
-          '-vsync',
-          '1',
-          '-preset',
-          'ultrafast',
-          '-pix_fmt',
-          'yuv420p',
-          '-an',
-          '-g',
-          '30',
-          '-keyint_min',
-          '30',
-          '-movflags',
-          '+faststart',
-          clipFileName
-        ]);
+      const res = await execWasmConcatFilterBatch(ffmpeg, segments, 'output.mp4', sourceHasAudio);
+      if (!res.ok) {
+        throw new Error('Error en FFmpeg al recodificar y unir los clips.');
+      }
+    } else {
+      // Batched concatenation for 6..20+ clips to keep WASM RAM stable
+      const totalBatches = Math.ceil(clips.length / WASM_CONCAT_BATCH_SIZE);
+      let currentLevelFiles: Array<{ file: string; duration: number }> = [];
+
+      for (let b = 0; b < totalBatches; b++) {
+        const startIdx = b * WASM_CONCAT_BATCH_SIZE;
+        const batchClips = clips.slice(startIdx, startIdx + WASM_CONCAT_BATCH_SIZE);
+        const batchFile = `batch_l0_${b}.mp4`;
+        tempFilesToClean.add(batchFile);
+
+        const basePct = 24 + Math.round((b / totalBatches) * 52);
+        const spanPct = Math.max(6, Math.round(52 / totalBatches));
+        const endClipNum = Math.min(totalClips, startIdx + batchClips.length);
+        const label = `Procesando lote ${b + 1}/${totalBatches} (clips ${startIdx + 1}-${endClipNum})...`;
+
+        setWasmProgressWindow(endClipNum, basePct, spanPct, label);
+        onProgress?.(startIdx + 1, totalClips, basePct, label);
+
+        const segments = batchClips.map((c) => ({
+          inputPath: inputPathInVfs,
+          startTime: Math.max(0, c.startTime),
+          duration: Math.max(0.25, c.endTime - c.startTime),
+          applyAudioFade: true
+        }));
+
+        const batchRes = await execWasmConcatFilterBatch(ffmpeg, segments, batchFile, sourceHasAudio);
+        if (!batchRes.ok) {
+          throw new Error(`Error en FFmpeg al procesar lote ${b + 1} de clips.`);
+        }
+        sourceHasAudio = batchRes.usedAudio;
+        currentLevelFiles.push({
+          file: batchFile,
+          duration: segments.reduce((acc, s) => acc + s.duration, 0)
+        });
       }
 
-      if (cutExit !== 0) {
-        throw new Error(`Error en FFmpeg al recortar clip ${i + 1} (código ${cutExit})`);
+      // Free source input before merging batches to reclaim memory
+      if (mountedWorkerFs) {
+        try {
+          await ffmpeg.unmount('/input');
+          mountedWorkerFs = false;
+        } catch {}
+      } else {
+        try {
+          await ffmpeg.deleteFile(inputPathInVfs);
+        } catch {}
       }
 
-      const clipData = await ffmpeg.readFile(clipFileName);
-      const clipLen = typeof clipData === 'string' ? clipData.length : clipData.byteLength;
-      if (clipLen < 500) {
-        throw new Error(`Clip ${i + 1} (${clipFileName}) generado vacío (${clipLen} bytes).`);
+      // Merge batch files cleanly via concat filter with PTS-STARTPTS (hierarchical if > 5 batches)
+      let level = 1;
+      while (currentLevelFiles.length > 1) {
+        const nextLevelFiles: Array<{ file: string; duration: number }> = [];
+        const groups = Math.ceil(currentLevelFiles.length / WASM_CONCAT_BATCH_SIZE);
+        const isFinalPass = groups === 1;
+
+        for (let g = 0; g < groups; g++) {
+          const groupItems = currentLevelFiles.slice(
+            g * WASM_CONCAT_BATCH_SIZE,
+            (g + 1) * WASM_CONCAT_BATCH_SIZE
+          );
+          const outFile = isFinalPass ? 'output.mp4' : `batch_l${level}_${g}.mp4`;
+          tempFilesToClean.add(outFile);
+
+          setWasmProgressWindow(
+            totalClips,
+            78,
+            16,
+            isFinalPass ? 'Ensamblando MP4 final sin saltos...' : `Consolidando bloques (${g + 1}/${groups})...`
+          );
+          onProgress?.(
+            totalClips,
+            totalClips,
+            isFinalPass ? 82 : 78,
+            isFinalPass ? 'Ensamblando MP4 final sin saltos...' : `Consolidando bloques (${g + 1}/${groups})...`
+          );
+
+          const mergeRes = await execWasmConcatFilterBatch(
+            ffmpeg,
+            groupItems.map((item) => ({
+              inputPath: item.file,
+              duration: item.duration,
+              applyAudioFade: false
+            })),
+            outFile,
+            sourceHasAudio
+          );
+
+          if (!mergeRes.ok) {
+            throw new Error('Error en FFmpeg al ensamblar el montaje final.');
+          }
+
+          // Immediately delete consumed batch files to keep MEMFS lean
+          for (const item of groupItems) {
+            try {
+              await ffmpeg.deleteFile(item.file);
+              tempFilesToClean.delete(item.file);
+            } catch {}
+          }
+
+          nextLevelFiles.push({
+            file: outFile,
+            duration: groupItems.reduce((acc, s) => acc + s.duration, 0)
+          });
+        }
+
+        currentLevelFiles = nextLevelFiles;
+        level += 1;
       }
-
-      const donePct = 25 + Math.round(((i + 1) / totalClips) * 55);
-      onProgress?.(i + 1, totalClips, donePct, `Clip ${i + 1} de ${totalClips} listo`);
-    }
-
-    onProgress?.(totalClips, totalClips, 84, 'Uniendo todos los clips en un único MP4...');
-    const listContent = inputFiles.map((fn) => `file '${fn}'`).join('\n');
-    await ffmpeg.writeFile('list.txt', new TextEncoder().encode(listContent));
-
-    let concatExit = await ffmpeg.exec([
-      '-y',
-      '-f',
-      'concat',
-      '-safe',
-      '0',
-      '-i',
-      'list.txt',
-      '-c:v',
-      'libx264',
-      '-r',
-      '30',
-      '-vsync',
-      '1',
-      '-preset',
-      'ultrafast',
-      '-pix_fmt',
-      'yuv420p',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
-      '-movflags',
-      '+faststart',
-      'output.mp4'
-    ]);
-
-    if (concatExit !== 0) {
-      concatExit = await ffmpeg.exec([
-        '-y',
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        'list.txt',
-        '-c:v',
-        'libx264',
-        '-r',
-        '30',
-        '-vsync',
-        '1',
-        '-preset',
-        'ultrafast',
-        '-pix_fmt',
-        'yuv420p',
-        '-an',
-        '-movflags',
-        '+faststart',
-        'output.mp4'
-      ]);
-    }
-
-    if (concatExit !== 0) {
-      throw new Error(`Error en FFmpeg al concatenar los clips (código ${concatExit})`);
     }
 
     onProgress?.(totalClips, totalClips, 95, 'Verificando archivo MP4 final...');
-    const rawOutput = await ffmpeg.readFile('output.mp4');
+    let rawOutput: Uint8Array | string | null = await ffmpeg.readFile('output.mp4');
     const uint8Output =
       rawOutput instanceof Uint8Array ? rawOutput : new TextEncoder().encode(rawOutput);
+    rawOutput = null;
 
     if (uint8Output.byteLength <= 500) {
       throw new Error(
@@ -339,12 +467,23 @@ export async function concatenateClipsWithFFmpegWasm(
       );
     }
 
-    const outputBlob = new Blob([new Uint8Array(uint8Output)], { type: 'video/mp4' });
+    // Remove output.mp4 from WASM MEMFS immediately after reading
+    try {
+      await ffmpeg.deleteFile('output.mp4');
+      tempFilesToClean.delete('output.mp4');
+    } catch {}
+
+    const outputBlob = new Blob([uint8Output as BlobPart], { type: 'video/mp4' });
     const blobUrl = URL.createObjectURL(outputBlob);
     onProgress?.(totalClips, totalClips, 100, '¡Vídeo completado a 30 FPS fluidos!');
     triggerBrowserDownload(blobUrl, targetFilename, outputBlob.size);
     return blobUrl;
   } finally {
+    if (activeProgressHandler) {
+      try {
+        ffmpeg.off('progress', activeProgressHandler);
+      } catch {}
+    }
     if (mountedWorkerFs) {
       try {
         await ffmpeg.unmount('/input');
@@ -354,13 +493,7 @@ export async function concatenateClipsWithFFmpegWasm(
         await ffmpeg.deleteFile('source.mp4');
       } catch {}
     }
-    try {
-      await ffmpeg.deleteFile('list.txt');
-    } catch {}
-    try {
-      await ffmpeg.deleteFile('output.mp4');
-    } catch {}
-    for (const f of inputFiles) {
+    for (const f of tempFilesToClean) {
       try {
         await ffmpeg.deleteFile(f);
       } catch {}
@@ -401,8 +534,8 @@ async function tryRemuxToCleanMp4(blob: Blob): Promise<Blob | null> {
 /**
  * Universal Fail-Safe Concatenation Pipeline:
  * 1. Native Server FFmpeg (instant <1s for files already on server or <= 24 MB).
- * 2. Client FFmpeg.wasm with WORKERFS (handles huge 2GB+ local match videos directly with 0 RAM copy).
- * 3. Client Canvas 30 FPS MediaRecorder + optional fast server MP4 remux.
+ * 2. Client FFmpeg.wasm with WORKERFS (single-pass or batched concat filter, 0 RAM source copy).
+ * 3. Client Dual-Deck Preloading Canvas + requestVideoFrameCallback + Web Audio 50ms Fade MediaRecorder.
  */
 export async function concatenateClipsWithFFmpeg(
   sourceVideoUrl: string,
@@ -454,7 +587,7 @@ export async function concatenateClipsWithFFmpeg(
       onProgress?.(1, totalClips, 25, 'Procesando clips con motor FFmpeg del servidor (30 FPS CFR)...');
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 35000);
+      const timeoutId = setTimeout(() => controller.abort(), 90000);
 
       const response = await fetch('/api/montage/ffmpeg-concat', {
         method: 'POST',
@@ -499,16 +632,97 @@ export async function concatenateClipsWithFFmpeg(
     onProgress?.(1, totalClips, 20, 'Procesando localmente con FFmpeg.wasm a 30 FPS...');
     return await concatenateClipsWithFFmpegWasm(sourceVideoUrl, clips, onProgress, targetFilename);
   } catch (wasmErr) {
-    console.warn('FFmpeg.wasm fallback to Canvas 30 FPS engine:', wasmErr);
+    console.warn('FFmpeg.wasm fallback to Dual-Deck Canvas 30 FPS engine:', wasmErr);
   }
 
-  // Strategy 3: Client Canvas CFR MediaRecorder (guaranteed 30 FPS capture)
+  // Strategy 3: Dual-Deck Preloading Canvas + requestVideoFrameCallback + Web Audio 50ms Fade
   onProgress?.(1, totalClips, 30, 'Generando vídeo mediante renderizador continuo a 30 FPS...');
   return concatenateClipsClientSide(sourceVideoUrl, clips, onProgress || (() => {}), targetFilename);
 }
 
+interface VideoDeck {
+  video: HTMLVideoElement;
+  gainNode: GainNode | null;
+}
+
+function createHiddenVideoDeck(sourceVideoUrl: string): HTMLVideoElement {
+  const video = document.createElement('video');
+  video.crossOrigin = 'anonymous';
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.muted = false;
+
+  // Visible layout dimensions prevent Chromium from throttling the hardware decoder
+  video.style.position = 'fixed';
+  video.style.left = '0';
+  video.style.top = '0';
+  video.style.width = '320px';
+  video.style.height = '180px';
+  video.style.opacity = '0.01';
+  video.style.pointerEvents = 'none';
+  video.style.zIndex = '-9999';
+  document.body.appendChild(video);
+  video.src = sourceVideoUrl;
+  return video;
+}
+
 /**
- * Rock-Solid Client-Side Video Concatenation Engine using HTML5 Canvas & MediaRecorder API.
+ * Preloads & seeks a standby video deck to `targetTime` so the next cut switches
+ * instantaneously with 0 black frames or seek stalls.
+ */
+function preloadDeckToTime(video: HTMLVideoElement, targetTime: number, timeoutMs = 1500): Promise<void> {
+  return new Promise((resolve) => {
+    const safeTarget = Math.max(0, targetTime);
+    if (Math.abs(video.currentTime - safeTarget) <= 0.04 && video.readyState >= 2) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('canplay', onCanPlay);
+      resolve();
+    };
+
+    const onCanPlay = () => {
+      if (Math.abs(video.currentTime - safeTarget) <= 0.25 && video.readyState >= 2) {
+        finish();
+      }
+    };
+
+    const onSeeked = () => {
+      if (video.readyState >= 2) {
+        finish();
+      } else {
+        video.addEventListener('canplay', finish, { once: true });
+      }
+    };
+
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.addEventListener('canplay', onCanPlay);
+    timer = setTimeout(finish, timeoutMs);
+
+    try {
+      video.pause();
+      video.currentTime = safeTarget;
+    } catch {
+      finish();
+    }
+  });
+}
+
+/**
+ * High-Precision Dual-Deck Client-Side Video Concatenation Engine:
+ * - Preloads the next clip on a standby <video> deck while the active clip plays (zero black frames).
+ * - Synchronizes canvas drawing using `requestVideoFrameCallback` at fixed resolution & 30 FPS.
+ * - Uses 6.5 Mbps bitrate (5-8 Mbps) and 50ms Web Audio fade-in/out per clip to prevent clicks.
+ * - Releases all buffers, DOM nodes, tracks, and AudioContext immediately upon completion.
  */
 export async function concatenateClipsClientSide(
   sourceVideoUrl: string,
@@ -521,23 +735,8 @@ export async function concatenateClipsClientSide(
   }
 
   return new Promise((resolve, reject) => {
-    const video = document.createElement('video');
-    video.crossOrigin = 'anonymous';
-    video.muted = true; // CRITICAL: Autoplay policy requires muted=true
-    video.playsInline = true;
-    video.preload = 'auto';
-
-    // Visible layout dimensions prevent Chromium from throttling video decoder
-    video.style.position = 'fixed';
-    video.style.left = '0';
-    video.style.top = '0';
-    video.style.width = '320px';
-    video.style.height = '180px';
-    video.style.opacity = '0.02';
-    video.style.pointerEvents = 'none';
-    video.style.zIndex = '-9999';
-    document.body.appendChild(video);
-    video.src = sourceVideoUrl;
+    const videoA = createHiddenVideoDeck(sourceVideoUrl);
+    const videoB = createHiddenVideoDeck(sourceVideoUrl);
 
     const canvas = document.createElement('canvas');
     canvas.width = 1280;
@@ -545,72 +744,189 @@ export async function concatenateClipsClientSide(
     const ctx = canvas.getContext('2d', { alpha: false });
 
     if (!ctx) {
-      if (video.parentNode) video.parentNode.removeChild(video);
+      videoA.remove();
+      videoB.remove();
       reject(new Error('No se pudo inicializar el Canvas 2D.'));
       return;
     }
 
-    const recordedChunks: Blob[] = [];
-    let mediaRecorder: MediaRecorder | null = null;
-    let animFrameId: number | null = null;
-    let fpsTimerId: any = null;
-    let isTerminated = false;
-    let hasStarted = false;
-    const totalClips = clips.length;
+    // Set up Web Audio API gain-controlled mixing (silent to speakers, recorded to stream)
+    let audioCtx: AudioContext | null = null;
+    let audioDest: MediaStreamAudioDestinationNode | null = null;
+    let gainA: GainNode | null = null;
+    let gainB: GainNode | null = null;
 
-    // Capture pure canvas stream at steady 30 FPS (avoids MediaRecorder audio track stalls across seeks)
-    const stream = canvas.captureStream(30);
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        audioCtx = new AudioCtx({ sampleRate: 44100 });
+        audioDest = audioCtx.createMediaStreamDestination();
 
-    let mimeType = 'video/webm;codecs=vp9';
-    if (!MediaRecorder.isTypeSupported(mimeType)) {
-      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
-        mimeType = 'video/webm;codecs=vp8';
-      } else if (MediaRecorder.isTypeSupported('video/webm')) {
-        mimeType = 'video/webm';
-      } else if (MediaRecorder.isTypeSupported('video/mp4')) {
-        mimeType = 'video/mp4';
-      } else {
-        mimeType = '';
+        const srcA = audioCtx.createMediaElementSource(videoA);
+        gainA = audioCtx.createGain();
+        gainA.gain.value = 0;
+        srcA.connect(gainA);
+        gainA.connect(audioDest);
+
+        const srcB = audioCtx.createMediaElementSource(videoB);
+        gainB = audioCtx.createGain();
+        gainB.gain.value = 0;
+        srcB.connect(gainB);
+        gainB.connect(audioDest);
+      }
+    } catch (audioErr) {
+      console.warn('Web Audio montage mix unavailable, continuing video-only:', audioErr);
+      audioCtx = null;
+      audioDest = null;
+      gainA = null;
+      gainB = null;
+    }
+
+    const decks: [VideoDeck, VideoDeck] = [
+      { video: videoA, gainNode: gainA },
+      { video: videoB, gainNode: gainB }
+    ];
+
+    const canvasStream = canvas.captureStream(TARGET_FPS);
+    const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
+    if (audioDest && audioDest.stream.getAudioTracks().length > 0) {
+      combinedTracks.push(...audioDest.stream.getAudioTracks());
+    }
+    const combinedStream = new MediaStream(combinedTracks);
+
+    const hasAudioTrack = combinedStream.getAudioTracks().length > 0;
+    const candidateMimes = hasAudioTrack
+      ? [
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm;codecs=vp9',
+          'video/webm;codecs=vp8',
+          'video/webm',
+          'video/mp4'
+        ]
+      : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
+
+    let mimeType = '';
+    for (const candidate of candidateMimes) {
+      if (MediaRecorder.isTypeSupported(candidate)) {
+        mimeType = candidate;
+        break;
       }
     }
 
+    const recordedChunks: Blob[] = [];
+    let mediaRecorder: MediaRecorder;
     try {
-      mediaRecorder = mimeType
-        ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 4500000 })
-        : new MediaRecorder(stream);
+      const options: MediaRecorderOptions = {
+        videoBitsPerSecond: CLIENT_VIDEO_BITRATE
+      };
+      if (hasAudioTrack) options.audioBitsPerSecond = 128_000;
+      if (mimeType) options.mimeType = mimeType;
+      mediaRecorder = new MediaRecorder(combinedStream, options);
     } catch {
-      mediaRecorder = new MediaRecorder(stream);
+      mediaRecorder = new MediaRecorder(combinedStream);
     }
 
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      if (e.data && e.data.size > 0) {
+        recordedChunks.push(e.data);
+      }
     };
+
+    const totalClips = clips.length;
+    let isTerminated = false;
+    let hasStarted = false;
+    let activeRvfcHandle: number | null = null;
+    let activeRafHandle: number | null = null;
+    let activeDeckRef: VideoDeck | null = null;
+    let standbyPreloadPromise: Promise<void> = Promise.resolve();
+
+    const hasRvfc =
+      typeof HTMLVideoElement !== 'undefined' &&
+      'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+    const stopFramePump = () => {
+      if (activeRvfcHandle !== null && activeDeckRef) {
+        try {
+          (activeDeckRef.video as any).cancelVideoFrameCallback?.(activeRvfcHandle);
+        } catch {}
+        activeRvfcHandle = null;
+      }
+      if (activeRafHandle !== null) {
+        cancelAnimationFrame(activeRafHandle);
+        activeRafHandle = null;
+      }
+    };
+
+    const cleanupResources = () => {
+      stopFramePump();
+      for (const d of decks) {
+        try {
+          d.video.pause();
+          d.video.removeAttribute('src');
+          d.video.load();
+          if (d.video.parentNode) {
+            d.video.parentNode.removeChild(d.video);
+          }
+        } catch {}
+      }
+      combinedStream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {}
+      });
+      if (audioCtx && audioCtx.state !== 'closed') {
+        audioCtx.close().catch(() => {});
+      }
+      canvas.width = 0;
+      canvas.height = 0;
+    };
+
+    const masterTimeout = setTimeout(() => {
+      console.warn('Master montage timeout reached, forcing finish...');
+      finishRecording();
+    }, Math.max(120000, totalClips * 25000));
 
     const finishRecording = () => {
       if (isTerminated) return;
       isTerminated = true;
+      clearTimeout(masterTimeout);
+      stopFramePump();
 
-      if (animFrameId) cancelAnimationFrame(animFrameId);
-      if (fpsTimerId) clearInterval(fpsTimerId);
-      video.pause();
-
-      if (video.parentNode) {
-        video.parentNode.removeChild(video);
+      for (const d of decks) {
+        try {
+          d.video.pause();
+        } catch {}
       }
 
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
+      if (mediaRecorder.state !== 'inactive') {
+        try {
+          if (mediaRecorder.state === 'paused') {
+            mediaRecorder.resume();
+          }
+          mediaRecorder.stop();
+        } catch {
+          cleanupResources();
+          reject(new Error('No se pudo finalizar la grabación del vídeo.'));
+        }
       } else {
+        cleanupResources();
         reject(new Error('No se pudo iniciar la grabación del vídeo.'));
       }
     };
 
     mediaRecorder.onstop = async () => {
-      const outputMime = mediaRecorder?.mimeType || 'video/webm';
-      let finalBlob = new Blob(recordedChunks, { type: outputMime });
+      const outputMime = mediaRecorder.mimeType || 'video/webm';
+      let finalBlob: Blob | null = new Blob(recordedChunks, { type: outputMime });
+      // Immediately release recorded chunks from memory
+      recordedChunks.length = 0;
+      cleanupResources();
 
       if (finalBlob.size <= 500) {
-        reject(new Error('El archivo generado está vacío. Asegúrese de que el vídeo es reproducible.'));
+        finalBlob = null;
+        reject(
+          new Error('El archivo generado está vacío. Asegúrese de que el vídeo es reproducible.')
+        );
         return;
       }
 
@@ -631,146 +947,227 @@ export async function concatenateClipsClientSide(
       }
 
       const blobUrl = URL.createObjectURL(finalBlob);
+      const finalSize = finalBlob.size;
+      finalBlob = null;
       onProgress(totalClips, totalClips, 100, '¡Descarga lista a 30 FPS!');
-      triggerBrowserDownload(blobUrl, finalName, finalBlob.size);
+      triggerBrowserDownload(blobUrl, finalName, finalSize);
       resolve(blobUrl);
     };
 
-    const drawFrame = () => {
-      if (ctx && video.readyState >= 2) {
+    const scheduleAudioFadeIn = (deck: VideoDeck) => {
+      if (!audioCtx || !deck.gainNode) return;
+      const now = audioCtx.currentTime;
+      deck.gainNode.gain.cancelScheduledValues(now);
+      deck.gainNode.gain.setValueAtTime(0, now);
+      deck.gainNode.gain.linearRampToValueAtTime(1, now + 0.05);
+    };
+
+    const scheduleAudioFadeOut = (deck: VideoDeck) => {
+      if (!audioCtx || !deck.gainNode) return;
+      const now = audioCtx.currentTime;
+      deck.gainNode.gain.cancelScheduledValues(now);
+      deck.gainNode.gain.setValueAtTime(deck.gainNode.gain.value, now);
+      deck.gainNode.gain.linearRampToValueAtTime(0, now + 0.05);
+    };
+
+    const silenceAudioImmediate = (deck: VideoDeck) => {
+      if (!audioCtx || !deck.gainNode) return;
+      const now = audioCtx.currentTime;
+      deck.gainNode.gain.cancelScheduledValues(now);
+      deck.gainNode.gain.setValueAtTime(0, now);
+    };
+
+    const drawDeckFrame = (video: HTMLVideoElement) => {
+      if (ctx && video.readyState >= 2 && canvas.width > 0 && canvas.height > 0) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       }
     };
 
-    const renderLoop = () => {
-      drawFrame();
-      animFrameId = requestAnimationFrame(renderLoop);
-    };
-    fpsTimerId = setInterval(drawFrame, 1000 / 30);
-
-    // Overall fail-safe timeout (maximum 120 seconds for whole montage)
-    const masterTimeout = setTimeout(() => {
-      console.warn('Master montage timeout reached, forcing finish...');
-      finishRecording();
-    }, 120000);
-
-    const playClip = (index: number) => {
+    const playClipAtIndex = async (index: number) => {
       if (isTerminated) return;
       if (index >= totalClips) {
-        clearTimeout(masterTimeout);
         finishRecording();
         return;
       }
 
       const clip = clips[index];
-      const stepPct = 30 + Math.round((index / totalClips) * 62);
-      onProgress(index + 1, totalClips, stepPct, `Renderizando: ${clip.title} (${index + 1}/${totalClips})...`);
-
+      const deck = decks[index % 2];
+      const standbyDeck = decks[(index + 1) % 2];
       const clipStart = Math.max(0, clip.startTime);
-      const clipEnd = Math.max(clipStart + 0.3, clip.endTime);
+      const clipEnd = Math.max(clipStart + 0.25, clip.endTime);
       const clipDur = clipEnd - clipStart;
 
-      let clipWatchdog: any = null;
+      const stepPct = 30 + Math.round((index / totalClips) * 62);
+      onProgress(
+        index + 1,
+        totalClips,
+        stepPct,
+        `Renderizando: ${clip.title} (${index + 1}/${totalClips})...`
+      );
+
+      // Wait for the preloaded active deck only if it hasn't finished seeking yet
+      if (deck.video.readyState < 2 || Math.abs(deck.video.currentTime - clipStart) > 0.25) {
+        const shouldPauseRecorder = index > 0 && mediaRecorder.state === 'recording';
+        if (shouldPauseRecorder) {
+          try {
+            mediaRecorder.pause();
+          } catch {}
+        }
+        await standbyPreloadPromise;
+        if (deck.video.readyState < 2 || Math.abs(deck.video.currentTime - clipStart) > 0.25) {
+          await preloadDeckToTime(deck.video, clipStart, 1500);
+        }
+        if (isTerminated) return;
+        if (shouldPauseRecorder && mediaRecorder.state === 'paused') {
+          try {
+            mediaRecorder.resume();
+          } catch {}
+        }
+      }
+
+      // Immediately pre-seek the standby deck to clip index + 1 while this clip plays
+      if (index + 1 < totalClips) {
+        const nextClipStart = Math.max(0, clips[index + 1].startTime);
+        standbyPreloadPromise = preloadDeckToTime(standbyDeck.video, nextClipStart, 1800);
+      } else {
+        standbyPreloadPromise = Promise.resolve();
+      }
+
+      // Draw exact first frame of the new clip before resuming/starting recorder
+      activeDeckRef = deck;
+      drawDeckFrame(deck.video);
+
+      if (index === 0 && mediaRecorder.state === 'inactive') {
+        if (audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
+        mediaRecorder.start(250);
+      }
+
+      silenceAudioImmediate(standbyDeck);
+      scheduleAudioFadeIn(deck);
+
       let hasAdvanced = false;
+      let hasTriggeredFadeOut = false;
+      let clipWatchdog: ReturnType<typeof setTimeout> | null = null;
 
       const advanceToNext = () => {
         if (hasAdvanced || isTerminated) return;
         hasAdvanced = true;
         if (clipWatchdog) clearTimeout(clipWatchdog);
-        video.removeEventListener('timeupdate', handleTimeUpdate);
-        video.pause();
-        playClip(index + 1);
+        stopFramePump();
+        deck.video.removeEventListener('timeupdate', handleTimeUpdate);
+        deck.video.removeEventListener('ended', advanceToNext);
+        silenceAudioImmediate(deck);
+        deck.video.pause();
+        playClipAtIndex(index + 1);
+      };
+
+      const checkProgressAndFade = (t: number) => {
+        if (!hasTriggeredFadeOut && clipDur > 0.15 && t >= clipEnd - 0.055) {
+          hasTriggeredFadeOut = true;
+          scheduleAudioFadeOut(deck);
+        }
+        if (t >= clipEnd) {
+          advanceToNext();
+        }
       };
 
       const handleTimeUpdate = () => {
-        if (video.currentTime >= clipEnd) {
-          advanceToNext();
-        }
+        checkProgressAndFade(deck.video.currentTime);
       };
 
-      const startPlayingThisClip = () => {
-        if (isTerminated || hasAdvanced) return;
-        drawFrame();
-
-        if (index === 0 && mediaRecorder && mediaRecorder.state === 'inactive') {
-          mediaRecorder.start(250);
-        }
-
-        if (!animFrameId) renderLoop();
-        video.playbackRate = 1.0;
-        video.play().catch((playErr) => {
-          console.warn('video.play() caught:', playErr);
-        });
-
-        video.addEventListener('timeupdate', handleTimeUpdate);
-
-        // Safe watchdog: advance if timeupdate fails to reach endTime within clipDur + 1.5s
-        const maxWaitMs = Math.max(1500, (clipDur + 1.5) * 1000);
-        clipWatchdog = setTimeout(() => {
-          console.warn(`Watchdog advancing clip ${index + 1}`);
-          advanceToNext();
-        }, maxWaitMs);
-      };
-
-      if (Math.abs(video.currentTime - clipStart) < 0.05) {
-        startPlayingThisClip();
-      } else {
-        let isSeekHandled = false;
-        const onSeekDone = () => {
-          if (isSeekHandled) return;
-          isSeekHandled = true;
-          video.removeEventListener('seeked', onSeekDone);
-          startPlayingThisClip();
-        };
-
-        video.addEventListener('seeked', onSeekDone, { once: true });
-        video.currentTime = clipStart;
-
-        // Fallback if browser doesn't emit seeked within 700ms
-        setTimeout(() => {
-          if (!isSeekHandled) {
-            onSeekDone();
+      const pumpVideoFrames = () => {
+        if (hasAdvanced || isTerminated || activeDeckRef !== deck) return;
+        drawDeckFrame(deck.video);
+        checkProgressAndFade(deck.video.currentTime);
+        if (!hasAdvanced && !isTerminated) {
+          if (hasRvfc) {
+            activeRvfcHandle = (deck.video as any).requestVideoFrameCallback(pumpVideoFrames);
+          } else {
+            activeRafHandle = requestAnimationFrame(pumpVideoFrames);
           }
-        }, 700);
+        }
+      };
+
+      deck.video.addEventListener('timeupdate', handleTimeUpdate);
+      deck.video.addEventListener('ended', advanceToNext, { once: true });
+      deck.video.playbackRate = 1.0;
+
+      if (hasRvfc) {
+        activeRvfcHandle = (deck.video as any).requestVideoFrameCallback(pumpVideoFrames);
+      } else {
+        activeRafHandle = requestAnimationFrame(pumpVideoFrames);
       }
+
+      deck.video.play().catch((playErr) => {
+        // Fallback if unmuted autoplay is blocked outside user gesture
+        if (playErr?.name === 'NotAllowedError') {
+          deck.video.muted = true;
+          standbyDeck.video.muted = true;
+          deck.video.play().catch((err2) => console.warn('video.play() retry failed:', err2));
+        } else {
+          console.warn('video.play() caught:', playErr);
+        }
+      });
+
+      const maxWaitMs = Math.max(1500, (clipDur + 1.5) * 1000);
+      clipWatchdog = setTimeout(() => {
+        console.warn(`Watchdog advancing clip ${index + 1}`);
+        advanceToNext();
+      }, maxWaitMs);
     };
 
-    const startProcessing = () => {
+    const startProcessing = async () => {
       if (hasStarted || isTerminated) return;
       hasStarted = true;
 
-      if (video.videoWidth && video.videoHeight) {
-        const aspect = video.videoWidth / video.videoHeight;
-        canvas.width = Math.min(1280, Math.max(640, video.videoWidth));
+      if (videoA.videoWidth && videoA.videoHeight) {
+        const aspect = videoA.videoWidth / videoA.videoHeight;
+        canvas.width = Math.min(1280, Math.max(640, videoA.videoWidth));
         canvas.height = Math.round(canvas.width / aspect);
-        // Ensure even dimensions for H.264
+        // Ensure even dimensions for H.264/VP9
         if (canvas.width % 2 !== 0) canvas.width -= 1;
         if (canvas.height % 2 !== 0) canvas.height -= 1;
       }
-      playClip(0);
+
+      // Preload Clip 0 on Deck A (and Clip 1 on Deck B in parallel if present)
+      const firstStart = Math.max(0, clips[0].startTime);
+      const preloadTasks = [preloadDeckToTime(decks[0].video, firstStart, 2000)];
+      if (clips.length > 1) {
+        standbyPreloadPromise = preloadDeckToTime(
+          decks[1].video,
+          Math.max(0, clips[1].startTime),
+          2000
+        );
+      }
+      await Promise.all(preloadTasks);
+      if (!isTerminated) {
+        playClipAtIndex(0);
+      }
     };
 
-    if (video.readyState >= 2) {
+    if (videoA.readyState >= 2) {
       startProcessing();
     } else {
-      video.onloadeddata = () => {
-        video.onloadeddata = null;
+      videoA.onloadeddata = () => {
+        videoA.onloadeddata = null;
         startProcessing();
       };
-      video.oncanplay = () => {
-        video.oncanplay = null;
+      videoA.oncanplay = () => {
+        videoA.oncanplay = null;
         startProcessing();
       };
       setTimeout(() => {
         startProcessing();
-      }, 1500);
+      }, 1800);
     }
 
-    video.onerror = () => {
+    videoA.onerror = () => {
+      if (isTerminated) return;
+      isTerminated = true;
       clearTimeout(masterTimeout);
-      if (video.parentNode) {
-        video.parentNode.removeChild(video);
-      }
+      cleanupResources();
       reject(new Error('Error al cargar la fuente de vídeo en el navegador.'));
     };
   });

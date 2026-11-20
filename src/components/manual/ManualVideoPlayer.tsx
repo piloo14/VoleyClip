@@ -30,14 +30,17 @@ import {
   Circle,
   MoveUpRight,
   Spline,
-  UserCheck
+  UserCheck,
+  FileSpreadsheet
 } from 'lucide-react';
 import { VolleyballFolder, ManualTacticalClip } from '../../types/manualTactical';
+import { DvwMatchData } from '../../types/dvw';
 import { captureVideoThumbnail } from '../../utils/thumbnailGenerator';
 import { uploadSourceVideoToServer } from '../../utils/videoMontage';
 import { formatTimecodeHMS, formatTimecodeShort } from '../../utils/timecode';
 import { TelestrationCanvas } from '../canvas/TelestrationCanvas';
 import { TelestrationShape, TelestrationTool } from '../../types/tactical';
+import { DvwSyncBar } from './DvwSyncBar';
 
 export interface CutFeedbackInfo {
   folderName: string;
@@ -77,7 +80,18 @@ export interface ManualVideoPlayerProps {
     updatedThumbnailUrl?: string
   ) => void;
   onVideoSourceChange: (newUrl: string, title: string) => void;
+  onVideoDurationChange?: (durationSec: number) => void;
   externalSeekTime?: number | null;
+  // Data Volley (.dvw) integration props
+  dvwData?: DvwMatchData | null;
+  selectedDvwSet?: number;
+  dvwSetOffsets?: Record<number, number>;
+  onDvwFileSelected?: (file: File) => void;
+  onSelectDvwSet?: (setNum: number) => void;
+  onSyncDvwSet?: (setNum: number, currentVideoTime: number) => void;
+  onNudgeDvwOffset?: (setNum: number, deltaSec: number) => void;
+  onOpenDvwModal?: () => void;
+  onClearDvw?: () => void;
 }
 
 export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideoPlayerProps>(
@@ -95,7 +109,17 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
       onClipCreated,
       onSaveClipTelestrations,
       onVideoSourceChange,
-      externalSeekTime
+      onVideoDurationChange,
+      externalSeekTime,
+      dvwData = null,
+      selectedDvwSet = 1,
+      dvwSetOffsets = {},
+      onDvwFileSelected,
+      onSelectDvwSet,
+      onSyncDvwSet,
+      onNudgeDvwOffset,
+      onOpenDvwModal,
+      onClearDvw
     },
     ref
   ) => {
@@ -129,6 +153,7 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
     const [showUrlInput, setShowUrlInput] = useState(false);
     const [customUrl, setCustomUrl] = useState('');
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const dvwInputRef = useRef<HTMLInputElement | null>(null);
 
     const activeFolder = folders.find((f) => f.id === activeFolderId) || folders[0];
 
@@ -515,19 +540,26 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
       }
     };
 
-    // Drag and drop video upload
+    // Drag and drop video or .dvw upload
     const handleDrop = (e: React.DragEvent) => {
       e.preventDefault();
       setIsDraggingOver(false);
-      const file = e.dataTransfer.files?.[0];
-      if (file && (file.type.startsWith('video/') || file.name.match(/\.(mp4|mov|webm|mkv|avi)$/i))) {
-        const blobUrl = URL.createObjectURL(file);
-        (window as any).__lastUploadedServerVideoPath = undefined;
-        (window as any).__lastUploadedFile = file;
-        (window as any).__lastUploadedBlobUrl = blobUrl;
-        onVideoSourceChange(blobUrl, file.name.replace(/\.[^/.]+$/, ''));
-        if (file.size <= 24 * 1024 * 1024) {
-          uploadSourceVideoToServer(file).catch(console.warn);
+      const files = Array.from(e.dataTransfer.files || []);
+      for (const file of files) {
+        if (file.name.toLowerCase().endsWith('.dvw')) {
+          onDvwFileSelected?.(file);
+        } else if (
+          file.type.startsWith('video/') ||
+          file.name.match(/\.(mp4|mov|webm|mkv|avi)$/i)
+        ) {
+          const blobUrl = URL.createObjectURL(file);
+          (window as any).__lastUploadedServerVideoPath = undefined;
+          (window as any).__lastUploadedFile = file;
+          (window as any).__lastUploadedBlobUrl = blobUrl;
+          onVideoSourceChange(blobUrl, file.name.replace(/\.[^/.]+$/, ''));
+          if (file.size <= 24 * 1024 * 1024) {
+            uploadSourceVideoToServer(file).catch(console.warn);
+          }
         }
       }
     };
@@ -549,7 +581,7 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
         <div className="px-4 py-2.5 bg-[#0F172A]/80 border-b border-[#334155] flex flex-wrap items-center justify-between gap-3 text-xs shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
             <Film className="w-4 h-4 text-[#3B82F6] shrink-0" />
-            <span className="font-semibold text-slate-100 truncate max-w-[220px] sm:max-w-md">
+            <span className="font-semibold text-slate-100 truncate max-w-[200px] sm:max-w-md">
               {videoTitle || 'Sin partido cargado'}
             </span>
             {videoUrl && (
@@ -564,12 +596,23 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
             )}
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
             <input
               type="file"
               ref={fileInputRef}
               accept="video/*"
               onChange={handleLocalFileUpload}
+              className="hidden"
+            />
+            <input
+              type="file"
+              ref={dvwInputRef}
+              accept=".dvw,.DVW"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) onDvwFileSelected?.(file);
+                e.target.value = '';
+              }}
               className="hidden"
             />
             <button
@@ -580,6 +623,21 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
               <Upload className="w-3.5 h-3.5" />
               <span>{videoUrl ? 'Cambiar Vídeo' : 'Subir Vídeo'}</span>
             </button>
+
+            {onDvwFileSelected && (
+              <button
+                onClick={() => dvwInputRef.current?.click()}
+                className={`px-3 py-1.5 rounded-lg border flex items-center gap-1.5 transition-colors font-semibold text-xs cursor-pointer whitespace-nowrap shrink-0 ${
+                  dvwData
+                    ? 'bg-[#10B981]/15 text-[#10B981] border-[#10B981]/50 hover:bg-[#10B981]/25'
+                    : 'bg-[#1E293B] hover:bg-slate-700 text-slate-200 border-[#334155]'
+                }`}
+                title="Importar archivo de scouting Data Volley (.dvw)"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5" />
+                <span>{dvwData ? 'Cambiar .DVW' : 'Importar .DVW'}</span>
+              </button>
+            )}
 
             <button
               onClick={() => setShowUrlInput(!showUrlInput)}
@@ -716,7 +774,11 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
                   if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
                 }}
                 onLoadedMetadata={() => {
-                  if (videoRef.current) setDuration(videoRef.current.duration || 0);
+                  if (videoRef.current) {
+                    const dur = videoRef.current.duration || 0;
+                    setDuration(dur);
+                    onVideoDurationChange?.(dur);
+                  }
                   updateVideoBox();
                 }}
                 onPlay={() => setIsPlaying(true)}
@@ -1189,6 +1251,21 @@ export const ManualVideoPlayer = forwardRef<ManualVideoPlayerHandle, ManualVideo
             ))}
           </div>
         </div>
+        {/* Data Volley (.dvw) Synchronization Panel */}
+        {dvwData && onSelectDvwSet && onSyncDvwSet && onNudgeDvwOffset && onOpenDvwModal && onClearDvw && (
+          <DvwSyncBar
+            dvwData={dvwData}
+            selectedSet={selectedDvwSet}
+            setOffsets={dvwSetOffsets}
+            currentVideoTime={currentTime}
+            hasVideo={Boolean(videoUrl)}
+            onSelectSet={onSelectDvwSet}
+            onSyncSetWithCurrentVideo={(setNum) => onSyncDvwSet(setNum, currentTime)}
+            onNudgeSetOffset={onNudgeDvwOffset}
+            onOpenAutoClipModal={onOpenDvwModal}
+            onClearDvw={onClearDvw}
+          />
+        )}
       </div>
     );
   }

@@ -15,7 +15,8 @@ import {
   ArrowDown,
   FileJson,
   SlidersHorizontal,
-  PenTool
+  PenTool,
+  Clock
 } from 'lucide-react';
 import { VolleyballFolder, ManualTacticalClip } from '../../types/manualTactical';
 import { concatenateClipsWithFFmpeg } from '../../utils/videoMontage';
@@ -40,6 +41,7 @@ interface TacticalRightSidebarProps {
   onReorderClipInFolder?: (clipId: string, direction: 'up' | 'down') => void;
   onUpdateClipTitle: (clipId: string, newTitle: string) => void;
   onUpdateClipNotes: (clipId: string, notes: string) => void;
+  onUpdateClipTimes?: (clipId: string, startTime: number, endTime: number) => void;
   onOpenMontageModal: (folderId: string) => void;
   onExportIndividualClip: (clip: ManualTacticalClip) => void;
   onClearFolderClips?: (folderId: string) => void;
@@ -66,6 +68,7 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
   onReorderClipInFolder,
   onUpdateClipTitle,
   onUpdateClipNotes,
+  onUpdateClipTimes,
   onOpenMontageModal,
   onExportIndividualClip,
   onClearFolderClips,
@@ -82,9 +85,10 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
   const [newFolderIcon, setNewFolderIcon] = useState('⚡');
   const [newFolderKey, setNewFolderKey] = useState('');
 
-  // Title editing state
+  // Title & Time editing state
   const [editingClipId, setEditingClipId] = useState<string | null>(null);
   const [editingTitleText, setEditingTitleText] = useState('');
+  const [editingTimesClipId, setEditingTimesClipId] = useState<string | null>(null);
 
   // Sidebar Inline Concatenation Rendering State
   const [isRendering, setIsRendering] = useState(false);
@@ -126,6 +130,12 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
     setEditingClipId(null);
   };
 
+  React.useEffect(() => {
+    return () => {
+      if (renderSuccessBlobUrl) URL.revokeObjectURL(renderSuccessBlobUrl);
+    };
+  }, [renderSuccessBlobUrl]);
+
   // Direct In-Sidebar Montage Concatenation
   const handleStartSidebarMontage = async () => {
     if (activeFolderClips.length === 0 || isRendering) return;
@@ -137,7 +147,10 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
     setIsRendering(true);
     setRenderProgress(10);
     setSidebarError(null);
-    setRenderSuccessBlobUrl(null);
+    setRenderSuccessBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
     setRenderingClipTitle('Preparando clips para exportación...');
 
     const targetFilename = `VoleyClip_${activeFolder.name.replace(/\s+/g, '_')}.mp4`;
@@ -479,6 +492,81 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
                     className="w-full bg-[#1E293B] border border-[#334155] focus:border-[#3B82F6] rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none transition-colors"
                   />
 
+                  {/* Manual IN / OUT Time Fine-Tuner Drawer */}
+                  {editingTimesClipId === clip.id && onUpdateClipTimes && (
+                    <div className="p-2 bg-[#1E293B] border border-[#334155] rounded-lg grid grid-cols-2 gap-2 text-[10px]">
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-[#10B981] font-mono font-semibold">IN</span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateClipTimes(
+                                clip.id,
+                                Math.max(0, +(clip.startTime - 0.5).toFixed(2)),
+                                clip.endTime
+                              )
+                            }
+                            className="px-1.5 py-0.5 bg-[#0F172A] border border-[#334155] rounded text-slate-200 hover:text-white font-mono cursor-pointer"
+                          >
+                            -0.5
+                          </button>
+                          <span className="font-mono tabular-time text-white">
+                            {formatTimecodeShort(clip.startTime)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateClipTimes(
+                                clip.id,
+                                Math.min(clip.endTime - 0.3, +(clip.startTime + 0.5).toFixed(2)),
+                                clip.endTime
+                              )
+                            }
+                            className="px-1.5 py-0.5 bg-[#0F172A] border border-[#334155] rounded text-slate-200 hover:text-white font-mono cursor-pointer"
+                          >
+                            +0.5
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-[#F97316] font-mono font-semibold">OUT</span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateClipTimes(
+                                clip.id,
+                                clip.startTime,
+                                Math.max(clip.startTime + 0.3, +(clip.endTime - 0.5).toFixed(2))
+                              )
+                            }
+                            className="px-1.5 py-0.5 bg-[#0F172A] border border-[#334155] rounded text-slate-200 hover:text-white font-mono cursor-pointer"
+                          >
+                            -0.5
+                          </button>
+                          <span className="font-mono tabular-time text-white">
+                            {formatTimecodeShort(clip.endTime)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateClipTimes(
+                                clip.id,
+                                clip.startTime,
+                                +(clip.endTime + 0.5).toFixed(2)
+                              )
+                            }
+                            className="px-1.5 py-0.5 bg-[#0F172A] border border-[#334155] rounded text-slate-200 hover:text-white font-mono cursor-pointer"
+                          >
+                            +0.5
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Quick Actions Row: Reorder, Preview, Move Folder, Download, Delete */}
                   <div className="pt-2 border-t border-[#334155]/70 flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1">
@@ -518,6 +606,21 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
                     </div>
 
                     <div className="flex items-center gap-1 shrink-0">
+                      {onUpdateClipTimes && (
+                        <button
+                          onClick={() =>
+                            setEditingTimesClipId((curr) => (curr === clip.id ? null : clip.id))
+                          }
+                          className={`p-1.5 rounded-md transition-colors cursor-pointer ${
+                            editingTimesClipId === clip.id
+                              ? 'text-[#3B82F6] bg-[#3B82F6]/15'
+                              : 'text-slate-300 hover:text-[#3B82F6] hover:bg-[#1E293B]'
+                          }`}
+                          title="Ajustar tiempos IN / OUT manualmente"
+                        >
+                          <Clock className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                       {onOpenClipTelestration && (
                         <button
                           onClick={() => onOpenClipTelestration(clip)}

@@ -676,14 +676,28 @@ app.post('/api/montage/ffmpeg-concat', async (req: Request, res: Response) => {
       ffmpegArgs.push('-ss', s.toFixed(3), '-t', dur.toFixed(3), '-i', sourcePath);
     }
 
-    // Filter complex graph
+    // Filter complex graph with per-clip PTS reset, uniform geometry, and 50ms audio fade-in/out
     const filterParts: string[] = [];
     const concatInputs: string[] = [];
 
     for (let i = 0; i < clips.length; i++) {
-      filterParts.push(`[${i}:v]fps=30,setpts=PTS-STARTPTS[v${i}]`);
+      const clip = clips[i];
+      let s = Math.max(0, Number(clip.startTime) || 0);
+      let e = Math.max(s + 0.3, Number(clip.endTime) || s + 1);
+      if (s >= videoDuration) s = Math.max(0, videoDuration - 1.5);
+      if (e > videoDuration) e = videoDuration;
+      let dur = +(e - s).toFixed(3);
+      if (dur < 0.2) dur = 0.5;
+
+      filterParts.push(
+        `[${i}:v]fps=30,scale='min(1920,iw)':-2:flags=bilinear,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`
+      );
       if (hasAudio) {
-        filterParts.push(`[${i}:a]asetpts=PTS-STARTPTS[a${i}]`);
+        const fadeDur = Math.min(0.05, +(dur / 3).toFixed(3));
+        const fadeOutStart = Math.max(0, +(dur - fadeDur).toFixed(3));
+        filterParts.push(
+          `[${i}:a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,afade=t=in:st=0:d=${fadeDur.toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur.toFixed(3)}[a${i}]`
+        );
         concatInputs.push(`[v${i}][a${i}]`);
       } else {
         concatInputs.push(`[v${i}]`);
@@ -697,9 +711,10 @@ app.post('/api/montage/ffmpeg-concat', async (req: Request, res: Response) => {
         '-map', '[outv]',
         '-map', '[outa]',
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '20',
+        '-preset', 'ultrafast',
+        '-crf', '22',
         '-pix_fmt', 'yuv420p',
+        '-r', '30',
         '-vsync', '1',
         '-c:a', 'aac',
         '-b:a', '128k',
@@ -715,10 +730,12 @@ app.post('/api/montage/ffmpeg-concat', async (req: Request, res: Response) => {
         '-filter_complex', filterParts.join(';'),
         '-map', '[outv]',
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '20',
+        '-preset', 'ultrafast',
+        '-crf', '22',
         '-pix_fmt', 'yuv420p',
+        '-r', '30',
         '-vsync', '1',
+        '-an',
         '-g', '30',
         '-keyint_min', '30',
         '-movflags', '+faststart',
@@ -747,15 +764,15 @@ app.post('/api/montage/ffmpeg-concat', async (req: Request, res: Response) => {
       `attachment; filename="${encodeURIComponent(targetFilename)}"`
     );
 
+    const cleanupJobDir = () => {
+      fs.promises.rm(jobDir, { recursive: true, force: true }).catch(() => {});
+    };
+
     const stream = fs.createReadStream(outputPath);
     stream.pipe(res);
-
-    stream.on('end', async () => {
-      // Clean up temporary job directory
-      try {
-        await fs.promises.rm(jobDir, { recursive: true, force: true });
-      } catch (e) {}
-    });
+    stream.on('end', cleanupJobDir);
+    stream.on('error', cleanupJobDir);
+    res.on('close', cleanupJobDir);
   } catch (error: any) {
     console.error('Error in /api/montage/ffmpeg-concat:', error);
     res.status(500).json({ error: error.message || 'FFmpeg concatenation failed' });
@@ -787,15 +804,18 @@ app.post('/api/montage/remux-mp4', async (req: Request, res: Response) => {
     await execFileAsync('/usr/bin/ffmpeg', [
       '-y',
       '-i', inputPath,
-      '-vf', 'fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2,setpts=PTS-STARTPTS',
+      '-vf', 'fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p,setpts=PTS-STARTPTS',
+      '-af', 'aresample=44100:async=1,asetpts=PTS-STARTPTS',
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '20',
+      '-preset', 'ultrafast',
+      '-crf', '22',
       '-pix_fmt', 'yuv420p',
+      '-r', '30',
       '-vsync', '1',
       '-g', '30',
       '-keyint_min', '30',
       '-c:a', 'aac',
+      '-ar', '44100',
       '-b:a', '128k',
       '-movflags', '+faststart',
       outputPath
@@ -808,11 +828,14 @@ app.post('/api/montage/remux-mp4', async (req: Request, res: Response) => {
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', outStat.size);
+    const cleanupRemuxDir = () => {
+      fs.promises.rm(jobDir, { recursive: true, force: true }).catch(() => {});
+    };
     const stream = fs.createReadStream(outputPath);
     stream.pipe(res);
-    stream.on('end', () => {
-      fs.promises.rm(jobDir, { recursive: true, force: true }).catch(() => {});
-    });
+    stream.on('end', cleanupRemuxDir);
+    stream.on('error', cleanupRemuxDir);
+    res.on('close', cleanupRemuxDir);
   } catch (err: any) {
     fs.promises.rm(jobDir, { recursive: true, force: true }).catch(() => {});
     console.error('Error in /api/montage/remux-mp4:', err);

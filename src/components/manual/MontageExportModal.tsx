@@ -39,11 +39,20 @@ export const MontageExportModal: React.FC<MontageExportModalProps> = ({
 
   React.useEffect(() => {
     setOrderedClips(initialClips);
-    setOutputBlobUrl(null);
+    setOutputBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
     setErrorMsg(null);
     setProgress(0);
     setIsRendering(false);
   }, [initialClips, folder]);
+
+  React.useEffect(() => {
+    return () => {
+      if (outputBlobUrl) URL.revokeObjectURL(outputBlobUrl);
+    };
+  }, [outputBlobUrl]);
 
   if (!isOpen) return null;
 
@@ -72,7 +81,10 @@ export const MontageExportModal: React.FC<MontageExportModalProps> = ({
     setIsRendering(true);
     setProgress(10);
     setErrorMsg(null);
-    setOutputBlobUrl(null);
+    setOutputBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
     setCurrentClipTitle('Iniciando unión de clips...');
 
     try {

@@ -15,8 +15,17 @@ import { MontageExportModal } from './components/manual/MontageExportModal';
 import { ShortcutsModal } from './components/manual/ShortcutsModal';
 import { ClearClipsModal } from './components/manual/ClearClipsModal';
 import { BackupModal } from './components/manual/BackupModal';
+import { DvwAutoClipModal } from './components/manual/DvwAutoClipModal';
 import { concatenateClipsWithFFmpeg } from './utils/videoMontage';
 import { TelestrationShape } from './types/tactical';
+import { DvwMatchData, DvwClipFilterOptions } from './types/dvw';
+import {
+  decodeDvwBuffer,
+  parseDvwContent,
+  resolveSetOffset,
+  buildDvwClipsPreview,
+  convertDvwPreviewToClips
+} from './utils/dvwParser';
 
 const STORAGE_KEY_FOLDERS = 'voleyclip_volleyball_folders_v1';
 const STORAGE_KEY_CLIPS = 'voleyclip_volleyball_clips_v1';
@@ -60,13 +69,20 @@ export default function App() {
   // 5. Video Source State (User's actual match video)
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [videoTitle, setVideoTitle] = useState<string>('');
+  const [videoDuration, setVideoDuration] = useState<number>(0);
 
   // 6. Active Inspected Clip & Telestration Trigger
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
   const [openTelestrationNonce, setOpenTelestrationNonce] = useState<number>(0);
   const [externalSeekTime, setExternalSeekTime] = useState<number | null>(null);
 
-  // 7. Modals
+  // 7. Data Volley (.dvw) Scouting & Sync State
+  const [dvwData, setDvwData] = useState<DvwMatchData | null>(null);
+  const [selectedDvwSet, setSelectedDvwSet] = useState<number>(1);
+  const [dvwSetOffsets, setDvwSetOffsets] = useState<Record<number, number>>({});
+  const [isDvwModalOpen, setIsDvwModalOpen] = useState<boolean>(false);
+
+  // 8. Modals
   const [isMontageModalOpen, setIsMontageModalOpen] = useState(false);
   const [targetMontageFolderId, setTargetMontageFolderId] = useState<string>(activeFolderId);
   const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState(false);
@@ -159,6 +175,85 @@ export default function App() {
     showToast('Nota táctica guardada');
   };
 
+  const handleUpdateClipTimes = (clipId: string, rawStartTime: number, rawEndTime: number) => {
+    const maxDur = videoDuration > 0 ? videoDuration : Number.POSITIVE_INFINITY;
+    const startTime = +Math.max(0, Math.min(maxDur - 0.3, rawStartTime)).toFixed(2);
+    const endTime = +Math.min(maxDur, Math.max(startTime + 0.3, rawEndTime)).toFixed(2);
+    const duration = +(endTime - startTime).toFixed(2);
+    setClips((prev) =>
+      prev.map((c) => (c.id === clipId ? { ...c, startTime, endTime, duration } : c))
+    );
+  };
+
+  // Data Volley (.dvw) Handlers
+  const handleDvwFileSelected = async (file: File) => {
+    try {
+      const buffer = await file.arrayBuffer();
+      const text = decodeDvwBuffer(buffer);
+      const parsed = parseDvwContent(text, file.name);
+      if (parsed.actions.length === 0) {
+        showToast('El archivo .dvw no contiene acciones con timestamp de vídeo');
+        return;
+      }
+      setDvwData(parsed);
+      setSelectedDvwSet(parsed.setsPresent[0] || 1);
+      setDvwSetOffsets({});
+      showToast(
+        `Scouting .dvw cargado: ${parsed.homeTeam} vs ${parsed.awayTeam} (${parsed.actions.length} acciones)`
+      );
+    } catch (err) {
+      console.error('Error al leer .dvw:', err);
+      showToast('No se pudo leer el archivo .dvw');
+    }
+  };
+
+  const handleSyncDvwSet = (setNum: number, currentVideoTime: number) => {
+    if (!dvwData) return;
+    const firstServeSec = dvwData.firstServeBySet[setNum];
+    if (firstServeSec === undefined) {
+      showToast(`No hay primer saque registrado en el Set ${setNum}`);
+      return;
+    }
+    const offset = +(currentVideoTime - firstServeSec).toFixed(2);
+    setDvwSetOffsets((prev) => ({ ...prev, [setNum]: offset }));
+    const sign = offset >= 0 ? '+' : '';
+    showToast(`Set ${setNum} sincronizado (offset ${sign}${offset.toFixed(1)}s)`);
+  };
+
+  const handleNudgeDvwOffset = (setNum: number, deltaSec: number) => {
+    setDvwSetOffsets((prev) => {
+      const current = resolveSetOffset(setNum, prev);
+      const updated = +(current + deltaSec).toFixed(2);
+      return { ...prev, [setNum]: updated };
+    });
+  };
+
+  const handleClearDvw = () => {
+    setDvwData(null);
+    setDvwSetOffsets({});
+    setIsDvwModalOpen(false);
+    showToast('Archivo .dvw cerrado');
+  };
+
+  const handleAddGeneratedDvwClips = (
+    filters: DvwClipFilterOptions,
+    targetFolderMode: 'active' | 'by_skill' | string
+  ) => {
+    if (!dvwData) return;
+    const previews = buildDvwClipsPreview(dvwData, filters, dvwSetOffsets, videoDuration);
+    if (previews.length === 0) {
+      showToast('No hay jugadas válidas para añadir');
+      return;
+    }
+    const generated = convertDvwPreviewToClips(previews, targetFolderMode, activeFolderId);
+    setClips((prev) => [...generated, ...prev]);
+    if (generated.length > 0) {
+      setActiveFolderId(generated[0].folderId);
+      setActiveClipId(generated[0].id);
+    }
+    showToast(`${generated.length} clips añadidos desde scouting .dvw`);
+  };
+
   const handleDeleteClip = (clipId: string) => {
     setClips((prev) => prev.filter((c) => c.id !== clipId));
     if (activeClipId === clipId) setActiveClipId(null);
@@ -222,7 +317,8 @@ export default function App() {
     showToast(`Generando vídeo para ${clip.title}...`);
     try {
       const filename = `VoleyClip_${clip.title.replace(/[^a-zA-Z0-9_-]/g, '_')}.mp4`;
-      await concatenateClipsWithFFmpeg(videoUrl, [clip], () => {}, filename);
+      const blobUrl = await concatenateClipsWithFFmpeg(videoUrl, [clip], () => {}, filename);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
       showToast(`Descarga completada: ${filename}`);
     } catch (err: any) {
       console.error('Error al exportar clip:', err);
@@ -417,7 +513,17 @@ export default function App() {
               setVideoTitle(newTitle);
               showToast(`Partido cargado: ${newTitle}`);
             }}
+            onVideoDurationChange={setVideoDuration}
             externalSeekTime={externalSeekTime}
+            dvwData={dvwData}
+            selectedDvwSet={selectedDvwSet}
+            dvwSetOffsets={dvwSetOffsets}
+            onDvwFileSelected={handleDvwFileSelected}
+            onSelectDvwSet={setSelectedDvwSet}
+            onSyncDvwSet={handleSyncDvwSet}
+            onNudgeDvwOffset={handleNudgeDvwOffset}
+            onOpenDvwModal={() => setIsDvwModalOpen(true)}
+            onClearDvw={handleClearDvw}
           />
         </section>
 
@@ -441,6 +547,7 @@ export default function App() {
             onReorderClipInFolder={handleReorderClipInFolder}
             onUpdateClipTitle={handleUpdateClipTitle}
             onUpdateClipNotes={handleUpdateClipNotes}
+            onUpdateClipTimes={handleUpdateClipTimes}
             onOpenMontageModal={handleOpenMontageModal}
             onExportIndividualClip={handleExportIndividualClip}
             onClearFolderClips={handleConfirmClearActiveFolder}
@@ -486,6 +593,23 @@ export default function App() {
         videoTitle={videoTitle}
         onExportBackup={handleExportBackupJSON}
         onImportBackup={handleImportBackupJSON}
+      />
+
+      {/* Data Volley (.dvw) Auto-Clip Generator Modal */}
+      <DvwAutoClipModal
+        isOpen={isDvwModalOpen}
+        onClose={() => setIsDvwModalOpen(false)}
+        dvwData={dvwData}
+        setOffsets={dvwSetOffsets}
+        videoDuration={videoDuration}
+        hasVideo={Boolean(videoUrl)}
+        folders={folders}
+        activeFolderId={activeFolderId}
+        onAddGeneratedClips={handleAddGeneratedDvwClips}
+        onPreviewSeek={(timeSec) => {
+          setExternalSeekTime(timeSec);
+          playerRef.current?.seekTo(timeSec);
+        }}
       />
     </div>
   );
