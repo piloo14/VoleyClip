@@ -16,7 +16,7 @@ import { ShortcutsModal } from './components/manual/ShortcutsModal';
 import { ClearClipsModal } from './components/manual/ClearClipsModal';
 import { BackupModal } from './components/manual/BackupModal';
 import { DvwAutoClipModal } from './components/manual/DvwAutoClipModal';
-import { concatenateClipsWithFFmpeg } from './utils/videoMontage';
+import { concatenateClipsWithFFmpeg, sortClipsChronologically } from './utils/videoMontage';
 import { TelestrationShape } from './types/tactical';
 import { DvwMatchData, DvwClipFilterOptions } from './types/dvw';
 import {
@@ -47,16 +47,16 @@ export default function App() {
     return DEFAULT_VOLLEYBALL_FOLDERS;
   });
 
-  // 2. Clips State
+  // 2. Clips State (always ordered chronologically ascending)
   const [clips, setClips] = useState<ManualTacticalClip[]>(() => {
     try {
       const saved =
         localStorage.getItem(STORAGE_KEY_CLIPS) || localStorage.getItem(LEGACY_KEY_CLIPS);
-      if (saved) return JSON.parse(saved);
+      if (saved) return sortClipsChronologically(JSON.parse(saved));
     } catch (e) {
       console.warn('Error loading clips:', e);
     }
-    return INITIAL_MANUAL_CLIPS;
+    return sortClipsChronologically(INITIAL_MANUAL_CLIPS);
   });
 
   // 3. Active Folder ID
@@ -125,7 +125,7 @@ export default function App() {
   };
 
   const handleClipCreated = (newClip: ManualTacticalClip) => {
-    setClips((prev) => [newClip, ...prev]);
+    setClips((prev) => sortClipsChronologically([...prev, newClip]));
     setActiveFolderId(newClip.folderId);
     setActiveClipId(newClip.id);
     const folder = folders.find((f) => f.id === newClip.folderId);
@@ -181,7 +181,9 @@ export default function App() {
     const endTime = +Math.min(maxDur, Math.max(startTime + 0.3, rawEndTime)).toFixed(2);
     const duration = +(endTime - startTime).toFixed(2);
     setClips((prev) =>
-      prev.map((c) => (c.id === clipId ? { ...c, startTime, endTime, duration } : c))
+      sortClipsChronologically(
+        prev.map((c) => (c.id === clipId ? { ...c, startTime, endTime, duration } : c))
+      )
     );
   };
 
@@ -246,7 +248,7 @@ export default function App() {
       return;
     }
     const generated = convertDvwPreviewToClips(previews, targetFolderMode, activeFolderId);
-    setClips((prev) => [...generated, ...prev]);
+    setClips((prev) => sortClipsChronologically([...prev, ...generated]));
     if (generated.length > 0) {
       setActiveFolderId(generated[0].folderId);
       setActiveClipId(generated[0].id);
@@ -389,7 +391,7 @@ export default function App() {
       setFolders(backupData.folders);
     }
     if (Array.isArray(backupData.clips)) {
-      setClips(backupData.clips);
+      setClips(sortClipsChronologically(backupData.clips));
     }
     showToast(
       `Copia restaurada: ${backupData.clips.length} clips en ${backupData.folders.length} categorías`
@@ -400,7 +402,9 @@ export default function App() {
   const activeClip = clips.find((c) => c.id === activeClipId) || null;
   const targetMontageFolder =
     folders.find((f) => f.id === targetMontageFolderId) || activeFolder;
-  const montageClips = clips.filter((c) => c.folderId === targetMontageFolder.id);
+  const montageClips = sortClipsChronologically(
+    clips.filter((c) => c.folderId === targetMontageFolder.id)
+  );
 
   return (
     <div className="min-h-screen lg:h-screen w-full bg-[#0F172A] text-slate-100 flex flex-col font-sans select-none lg:overflow-hidden">

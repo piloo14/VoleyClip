@@ -6,6 +6,18 @@ export interface MontageProgressCallback {
   (currentClipIndex: number, totalClips: number, percentage: number, currentClipTitle: string): void;
 }
 
+/**
+ * Orders clips chronologically ascending by original video startTime,
+ * breaking ties by ascending createdAt timestamp.
+ */
+export function sortClipsChronologically(clips: ManualTacticalClip[]): ManualTacticalClip[] {
+  return [...clips].sort((a, b) => {
+    const startDiff = (Number(a.startTime) || 0) - (Number(b.startTime) || 0);
+    if (startDiff !== 0) return startDiff;
+    return (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0);
+  });
+}
+
 const MAX_DIRECT_UPLOAD_BYTES = 24 * 1024 * 1024; // 24 MB (safe under Cloud Run 32MB request limit)
 const WASM_CONCAT_BATCH_SIZE = 5; // Keep peak WASM heap bounded even with 15-20+ clips
 const TARGET_FPS = 30;

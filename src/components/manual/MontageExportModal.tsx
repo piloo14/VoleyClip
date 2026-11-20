@@ -11,7 +11,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { VolleyballFolder, ManualTacticalClip } from '../../types/manualTactical';
-import { concatenateClipsWithFFmpeg } from '../../utils/videoMontage';
+import { concatenateClipsWithFFmpeg, sortClipsChronologically } from '../../utils/videoMontage';
 import { formatTimecodeShort } from '../../utils/timecode';
 
 interface MontageExportModalProps {
@@ -29,7 +29,9 @@ export const MontageExportModal: React.FC<MontageExportModalProps> = ({
   clips: initialClips,
   videoSourceUrl
 }) => {
-  const [orderedClips, setOrderedClips] = useState<ManualTacticalClip[]>(initialClips);
+  const [orderedClips, setOrderedClips] = useState<ManualTacticalClip[]>(() =>
+    sortClipsChronologically(initialClips)
+  );
   const [isRendering, setIsRendering] = useState(false);
   const [progress, setProgress] = useState(0);
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
@@ -38,7 +40,7 @@ export const MontageExportModal: React.FC<MontageExportModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   React.useEffect(() => {
-    setOrderedClips(initialClips);
+    setOrderedClips(sortClipsChronologically(initialClips));
     setOutputBlobUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;

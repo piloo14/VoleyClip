@@ -19,7 +19,7 @@ import {
   Clock
 } from 'lucide-react';
 import { VolleyballFolder, ManualTacticalClip } from '../../types/manualTactical';
-import { concatenateClipsWithFFmpeg } from '../../utils/videoMontage';
+import { concatenateClipsWithFFmpeg, sortClipsChronologically } from '../../utils/videoMontage';
 import { formatTimecodeShort } from '../../utils/timecode';
 
 interface TacticalRightSidebarProps {
@@ -76,7 +76,9 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
   onOpenBackupModal
 }) => {
   const activeFolder = folders.find((f) => f.id === activeFolderId) || folders[0];
-  const activeFolderClips = clips.filter((c) => c.folderId === activeFolderId);
+  const activeFolderClips = sortClipsChronologically(
+    clips.filter((c) => c.folderId === activeFolderId)
+  );
   const totalFolderDuration = activeFolderClips.reduce((acc, c) => acc + c.duration, 0);
 
   // New Folder creation state
@@ -155,10 +157,12 @@ export const TacticalRightSidebar: React.FC<TacticalRightSidebarProps> = ({
 
     const targetFilename = `VoleyClip_${activeFolder.name.replace(/\s+/g, '_')}.mp4`;
 
+    const clipsToJoin = sortClipsChronologically(activeFolderClips);
+
     try {
       const blobUrl = await concatenateClipsWithFFmpeg(
         videoSourceUrl,
-        activeFolderClips,
+        clipsToJoin,
         (currentIdx, _total, percent, title) => {
           setCurrentRenderingClipIdx(currentIdx);
           setRenderProgress(percent);
